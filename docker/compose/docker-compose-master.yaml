@@ -15,11 +15,9 @@
 # limitations under the License.
 #
 
-version: "3"
-
 services:
   apisix:
-    image: "apache/apisix:${APISIX_DOCKER_TAG}"
+    image: "apache/apisix:${APISIX_DOCKER_TAG:-3.14.1-debian}"
     restart: always
     volumes:
       - ./apisix_conf/master/config.yaml:/usr/local/apisix/conf/config.yaml:ro
@@ -42,8 +40,15 @@ services:
       ALLOW_NONE_AUTHENTICATION: "yes"
       ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
       ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    # Port not exposed externally - only internal network access
+    networks:
+      - apisix
+
+  httpbin:
+    image: ghcr.io/mccutchen/go-httpbin
+    restart: always
     ports:
-      - "2379:2379/tcp"
+      - "8280:8080/tcp"
     networks:
       - apisix
 
