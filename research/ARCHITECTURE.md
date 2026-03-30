@@ -45,6 +45,77 @@ flowchart TD
 - `t/` 하위의 Test::Nginx 기반 테스트는 실행 가능한 시스템 행위를 문서화한다.
 - `ci/`와 `Makefile`은 유지보수 규율과 품질 게이트를 드러낸다.
 
+## 세부 소스코드 검토
+
+### 부트스트랩과 worker 생명주기
+
+`apisix/init.lua`를 기준으로 보면 APISIX는 단일 엔트리포인트에서 모든 핵심 서브시스템을 순차적으로 붙인다.
+
+- `http_init` 단계에서 resolver, id, env, privileged agent, config center 초기화를 수행한다.
+- `http_init_worker` 단계에서 events, lrucache, discovery, balancer, admin, timers, debug, plugin, router, service, consumer, secret, global rules, upstream, ext-plugin, control router를 차례대로 기동한다.
+- 이 순서는 단순 나열이 아니라 의존성 순서다. 예를 들어 라우터는 config watcher가 준비된 뒤 의미가 있고, Prometheus 초기화는 관련 worker가 살아난 뒤 호출된다.
+
+이 구조는 agent-first 분석에서 매우 중요하다. 에이전트는 기능 파일 하나를 읽는 것보다 초기화 순서를 보면 런타임의 실제 결합 관계를 더 빨리 이해할 수 있다.
+
+### 라우팅 빌드와 매칭의 실제 흐름
+
+`apisix/router.lua`와 `apisix/http/route.lua`, `apisix/http/router/radixtree_uri.lua`를 함께 보면 라우팅은 다음 흐름으로 작동한다.
+
+1. worker 초기화 시 현재 설정의 HTTP 라우터 종류를 읽는다.
+2. `/routes` config watcher를 통해 route 집합을 동기화한다.
+3. 각 route는 `filter` 과정에서 host 정규화와 upstream 정리를 거친다.
+4. radixtree 구조를 빌드해 URI, method, host, remote_addr, vars 조건을 포함한 dispatch 테이블을 만든다.
+5. 요청 시 `dispatch`가 `api_ctx`에 `matched_route`와 `matched_params`를 기록한다.
+
+특히 주목할 점은 route 빌드가 단순 경로 인덱싱이 아니라 서비스 연계, `filter_func`, `vars` expression 검증, plugin checker까지 포함한 정제 파이프라인이라는 점이다. 따라서 APISIX의 route는 단순 proxy rule이 아니라 정책 객체에 가깝다.
+
+### upstream 해석과 health check 결합
+
+`apisix/upstream.lua`는 요청이 어느 upstream으로 가는지를 정하는 것 이상을 수행한다.
+
+- route 또는 service에서 선택된 upstream을 `api_ctx`에 버전화된 키로 저장한다.
+- service discovery가 설정된 경우 discovery provider를 호출해 동적으로 node 목록을 갱신한다.
+- port가 생략된 node는 scheme 기준으로 보정한다.
+- stream과 HTTP 모드에 따라 서로 다른 TLS 처리 분기를 가진다.
+- healthcheck manager에서 checker를 가져와 `api_ctx.up_checker`에 연결한다.
+
+즉 upstream은 정적 config blob가 아니라 discovery, TLS, healthcheck, runtime cache가 합쳐진 런타임 객체다. 이 때문에 에이전트가 장애 원인을 찾을 때 route만 보고 끝내면 안 되고 upstream 재해석 경로를 함께 봐야 한다.
+
+### Admin API는 리소스 라우터다
+
+`apisix/admin/init.lua`는 Admin API를 단일 핸들러가 관리하지만 내부적으로는 리소스 타입별 모듈로 위임한다.
+
+- 토큰 검증에서 `viewer`와 `admin` 역할을 분리한다.
+- URI segment를 분해해 `routes`, `services`, `upstreams`, `consumers`, `plugin_metadata`, `stream_routes` 등 리소스로 라우팅한다.
+- JSON request body를 디코드하고 `ttl` 같은 query 인자를 검증한다.
+- 결과는 v2 혹은 v3 adapter를 통해 필터링되고, etcd 내부 메타데이터는 응답에서 제거된다.
+
+이 설계는 사람이 보기에도 명확하지만 에이전트에게 특히 유리하다. 리소스 중심이기 때문에 `resource x method` 조합으로 행동을 추론할 수 있고, Admin API 테스트는 곧 리소스 CRUD의 행위 사양이 된다.
+
+## 행위 기반 시나리오 요약
+
+### 시나리오 A: route 생성
+
+`t/admin/routes.t` 기준으로 route 생성은 단순 PUT 요청이 아니라 다음 보장을 포함한다.
+
+- request body 스키마가 route 리소스 규칙을 만족해야 한다.
+- etcd 키는 `/apisix/routes/<id>` 아래에 기록된다.
+- 생성 후 GET으로 동일 구조를 재조회할 수 있어야 한다.
+- POST로 자동 생성된 route도 create_time과 update_time이 저장된다.
+
+이 테스트는 문서가 설명하지 않는 운영 사실도 드러낸다. 예를 들어 APISIX는 리소스 생성 시 시간을 메타데이터로 남기며, 테스트는 이를 불변 조건으로 간주한다.
+
+### 시나리오 B: standalone config API
+
+`t/admin/standalone.spec.ts`를 보면 standalone API-driven 모드는 문서 설명보다 더 구체적인 행위를 가진다.
+
+- 초기 상태에서는 resource별 conf_version이 0이다.
+- PUT 갱신 시 digest가 다르면 202를 반환하고 `x-last-modified`, `x-digest`를 기록한다.
+- 동일 digest 재전송은 204로 short-circuit된다.
+- HEAD 요청은 전체 body 없이 메타데이터만 확인하는 운영 경로다.
+
+이는 곧 APISIX가 standalone 모드에서 단순 파일 리로더가 아니라 버전과 digest를 가진 구성 저장소처럼 동작함을 의미한다.
+
 ## 에이전트 우선 관점에서 본 주요 레이어
 
 | 레이어 | 역할 | 에이전트 가독성 | 연구 메모 |
@@ -73,3 +144,8 @@ flowchart TD
 
 APISIX는 이미 에이전트가 활용할 수 있는 구조적 힌트를 많이 갖고 있다. 다만 원문에서 제시된 agent-first 방식처럼 더 높은 자율성을 얻으려면 현재의 풍부한 문서와 테스트를 검색 가능한 연구 지식으로 재배열하는 작업이 중요하다.
 
+가장 중요한 통찰은 다음과 같다.
+
+- 실제 동작의 중심은 `README`보다 bootstrap과 test 파일에 더 선명하게 드러난다.
+- Admin API, route matching, upstream resolution, standalone config API는 모두 리소스 중심 상태기계로 해석할 수 있다.
+- APISIX는 agent-readable한 코드가 적지 않지만, 그 가독성은 파일 하나가 아니라 여러 파일을 횡단해서 읽을 때 비로소 드러난다.
